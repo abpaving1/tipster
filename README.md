@@ -54,6 +54,22 @@ Before your first real run:
 
 Run unit tests: `pytest tests/`
 
+For development, install test tooling:
+
+```bash
+git clone ...
+cd tipster
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt -r requirements-dev.txt
+playwright install chromium
+```
+
+## CI
+
+A GitHub Actions workflow has been added at `.github/workflows/python-ci.yml`.
+It installs runtime and dev dependencies, runs `pytest`, and checks code with `ruff`.
+
 ## Docker Compose (Recommended for Development)
 
 A full local stack with Redis + TimescaleDB is provided:
