@@ -1,3 +1,4 @@
-pytest>=8.4,<9
-pytest-asyncio>=0.25,<0.26
-ruff>=0.0.275,<1.0
+-r python_server/requirements.txt
+mypy==1.11.2
+pytest-timeout==2.3.1
+chevron==0.14.0

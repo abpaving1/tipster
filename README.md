@@ -1,115 +1,252 @@
-# Scraper Service — Betting Tipster Aggregator
+# AI Chat Demo
 
-Python + Playwright scrapers for the tipster/statistical sources. Task 2 ships
-the OLBG module; Forebet, FreeSuperTips and SoccerVista follow in Tasks 3–4
-using this same `BaseSourceScraper` pattern.
+Multi‑room real‑time chat with optional AI answers. Start locally in a minute. Move to Azure when you're ready—no code changes.
 
-## Setup
+> Want architecture diagrams, CloudEvents/tunnel details, RBAC & env matrix? See **[docs/ADVANCED.md](./docs/ADVANCED.md)**.
+> Release history: **[RELEASE_NOTES.md](./RELEASE_NOTES.md)**
 
+## What You Get
+- Real‑time rooms (create / join instantly)
+- AI bot responses (GitHub Models via your PAT)
+- Persistence + scale when on Azure Web PubSub
+- Same React UI + Python backend in all modes
+
+## Quick Start
+
+Prereqs:
+* Python 3.12+
+* Node 18+
+
+1. Create a PAT with **Models – Read**: https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens
+2. (Recommended) Create and activate a virtual environment:
+   * macOS/Linux (bash/zsh):
+     ```bash
+     python3 -m venv .venv
+     source .venv/bin/activate
+     python -m pip install --upgrade pip
+     ```
+   * Windows (PowerShell):
+     ```pwsh
+     python -m venv .venv
+     .venv\Scripts\Activate.ps1
+     python -m pip install --upgrade pip
+     ```
+   Deactivate anytime with:
+   ```bash
+   deactivate
+   ```
+3. Install backend + frontend deps (inside the venv):
+   ```bash
+   pip install -r requirements.txt
+   # optional (tests, typing): pip install -r requirements-dev.txt
+   ```
+4. (Set token if you want AI answers)
+   ```bash
+   export GITHUB_TOKEN=<your_pat>        # bash/zsh
+   # PowerShell
+   $env:GITHUB_TOKEN="<your_pat>"
+   ```
+   Alternatively, you can update GITHUB_TOKEN in [./python_server/.env](./python_server/.env)
+5. Start everything (serves React build automatically):
+   ```bash
+   python start_dev.py
+   ```
+6. Open http://localhost:5173
+
+Running services:
+* HTTP API :5000
+* Local WebSocket :5001 (self transport)
+
+## Using the App
+1. Browse to http://localhost:5173
+2. You're placed in room `public`
+3. Create / join a room: type a name → Enter
+4. Ask something; the AI bot replies (uses your GitHub token)
+5. Open a second window to watch live streaming & room isolation
+
+### Tests
+
+Install dev extras first:
 ```bash
-cd scraper
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-playwright install chromium
-
-cp .env.example .env
-# Fill in PROXY_HOST / PROXY_USERNAME / PROXY_PASSWORD from your
-# Webshare or Bright Data residential proxy dashboard.
+pip install -r requirements-dev.txt
 ```
 
-Redis must be running locally (or `REDIS_URL` pointed at your instance):
-
+Backend (pytest):
 ```bash
-docker run -d -p 6379:6379 redis:7-alpine
+python -m pytest python_server/tests -q
+```
+Single file:
+```bash
+python -m pytest python_server/tests/test_runtime_config.py -q
+```
+Verbose / timing:
+```bash
+python -m pytest -vv
 ```
 
-## Running
+Frontend (Vitest + RTL):
+```bash
+npm --prefix client test
+```
+Selected coverage areas (backend): config merge, room store limits, transport factory, room lifecycle, streaming send path.
+
+## Deploy to Azure
+Install the Azure Developer CLI if you haven't: https://learn.microsoft.com/azure/developer/azure-developer-cli/install-azd
 
 ```bash
-python cli.py olbg
+azd env new chatenv
+azd env set githubModelsToken ghp_your_token_here   # store token for this env
+azd up
 ```
 
-First run with `SCRAPE_HEADLESS=false` in `.env` so you can watch the browser
-and confirm selectors against the live page.
+Security note: `azd env set` persists the value in the environment state on disk; avoid committing the `.azure` folder.
 
-## OLBG scraping notes
+That single `azd up` command:
+1. Provisions Azure Web PubSub + Storage + App Service (with Managed Identity)
+2. Builds the React client
+3. Deploys the Python backend
+4. Applies app settings sourced from previously persisted environment values (e.g. `githubModelsToken` set via `azd env set`)
+5. Prints your site URL + negotiate endpoint
 
-The OLBG scraper targets `https://www.olbg.com/betting-tips/Football/1`
-(configurable via `OLBG_BASE_URL`). Tips are extracted from embedded JSON in
-the page HTML (primary path), with a DOM fallback if that payload is missing.
+### Enable AI Features (One-time Setup)
+**Recommended Default:** Pass the token via secure Bicep parameter at provision time (Option A). This avoids surprise hooks and keeps behavior explicit. For production, prefer Key Vault (Option D).
 
-Listing rows are community-popular selections (not individual tipster cards).
-Each pick uses `tip_hash` as `tipster_external_id` and `"OLBG Popular"` as
-`tipster_name`. Unmapped markets are skipped rather than defaulted.
-
-Before your first real run:
-
-1. Set `SCRAPE_HEADLESS=false`, run `python cli.py olbg`, and confirm the
-   listing loads through your proxy.
-2. Check logs for `unmapped_market_label` warnings and extend
-   `MARKET_LABEL_MAP` in `sources/olbg.py` if needed.
-3. Confirm your proxy provider's sticky-session username format in
-   `utils/proxy.py::_build_username`.
-
-Run unit tests: `pytest tests/`
-
-For development, install test tooling:
-
+**Option A (Secure Bicep Parameter – default)**
 ```bash
-git clone ...
-cd tipster
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt -r requirements-dev.txt
-playwright install chromium
+azd env set githubModelsToken ghp_your_token_here
+azd up
 ```
+Rotate: `azd env set githubModelsToken <new>` then `azd provision`.
+Remove: `azd env unset githubModelsToken` then `azd provision`.
 
-## CI
-
-A GitHub Actions workflow has been added at `.github/workflows/python-ci.yml`.
-It installs runtime and dev dependencies, runs `pytest`, and checks code with `ruff`.
-
-## Docker Compose (Recommended for Development)
-
-A full local stack with Redis + TimescaleDB is provided:
-
+**Option B (Manual CLI – update anytime)**
 ```bash
-docker compose up -d
-# Wait for postgres to be ready, then initialize schema:
-docker compose exec postgres psql -U postgres -d tippster -f /app/sql/schema.sql
+az webapp config appsettings set \
+   --resource-group <your-resource-group> \
+   --name <your-web-app-name> \
+   --settings GITHUB_TOKEN="ghp_your_github_token_here"
+
+az webapp restart \
+   --resource-group <your-resource-group> \
+   --name <your-web-app-name>
 ```
 
-Then run scrapers/processor inside the container or on host.
+**Option C (Portal)** Azure Portal → App Service → Configuration → Application settings → New application setting: Name=`GITHUB_TOKEN`, Value=`your-token`
 
-## Architecture notes
+**Option D (Key Vault Reference – production / rotation)**
+1. Store the PAT as a secret in a Key Vault you control.
+2. Grant the web app’s managed identity `get` permissions.
+3. Add an app setting: `GITHUB_TOKEN=@Microsoft.KeyVault(SecretUri=https://<vault>.vault.azure.net/secrets/<secret-name>/<version>)`
+4. Restart the web app.
 
-- `sources/base_scraper.py` — shared browser lifecycle, stealth patching,
-  proxy config, retry-with-backoff, and cookie/session persistence
-  (`.storage_state/<source>.json`) so each run resumes as a returning visitor.
-- `models/pick.py` — typed contract pushed onto Redis; the processor (Task 5)
-  resolves `fixture_id`/`tipster_id` and writes to Postgres using
-  `ON CONFLICT (fixture_id, tipster_id, market, selection) DO UPDATE`,
-  since the schema's dedup index no longer includes `posted_at`.
-- Dead-letter queue: Failed picks go to `queue:picks:failed` (see `processor/consumer.py`).
-- `utils/jitter.py` — randomised delays and scroll behaviour between actions.
-- `utils/proxy.py` — sticky residential-proxy session per scrape run.
-
-## Dead Letter Queue (DLQ)
-
-Failed picks (invalid JSON, processing errors after retries) are moved to `queue:picks:failed`.
-
-Replay them with:
-
+### Next Changes
 ```bash
-python scripts/replay_dlq.py --limit 20
+azd deploy   # code only (frontend or backend)
+```
+Infra template changes:
+```bash
+azd provision && azd deploy
 ```
 
-## Adding a new source (Forebet, FreeSuperTips, SoccerVista — Tasks 3–4)
+## Core Environment Variables
+| Variable | Purpose |
+|----------|---------|
+| `GITHUB_TOKEN` | Enables AI responses (GitHub Models) |
+| `TRANSPORT_MODE` | `self` (default) or `webpubsub` to use Azure Web PubSub service |
+| `STORAGE_MODE` | `memory` (default) or `table` for Azure Table / Azurite persistence |
+| `WEBPUBSUB_ENDPOINT` or `WEBPUBSUB_CONNECTION_STRING` | The Azure Web PubSub endpoint when transport_mode is `webpubsub` |
+| `AZURE_STORAGE_ACCOUNT` or `AZURE_STORAGE_CONNECTION_STRING`| The Azure Storage endpoint when storage_mode is `table` |
+| `WEBPUBSUB_HUB` | (Optional) Override the hub name used for the chat app when using Web PubSub (default: demo_ai_chat) |
+| `CHAT_TABLE_NAME` | (Optional) Override Azure Table name (default: chatmessages) |
 
-1. Create `sources/<name>.py`, subclass `BaseSourceScraper`.
-2. Set `source_slug` and `base_url`.
-3. Implement `scrape()` returning `list[RawPick]`, publishing each pick via
-   `self.publish_pick(pick)` as you find it (don't batch to the end — if the
-   run dies partway through, you keep what was already published).
-4. Register it in `cli.py`'s `SCRAPERS` dict.
+Notes:
+- In Azure deployment the Bicep sets `TRANSPORT_MODE=webpubsub` and `STORAGE_MODE=table`.
+- Locally you can mix and match (e.g. `self+table` with Azurite or `webpubsub+memory`).
+
+## Custom Resource Names (Optional)
+Want predictable names? Provide overrides (must be globally unique where required):
+```bash
+azd env set webPubSubNameOverride mywps1234
+azd env set webAppNameOverride mychatweb1234
+azd provision
+```
+
+## Iteration Cheatsheet
+| Change | Command |
+|--------|---------|
+| Backend / frontend code | `azd deploy` |
+| Infra (Bicep) changes | `azd provision && azd deploy` |
+| New environment | `azd env new <name> --location <region>` then `azd up` |
+
+## Hybrid Local + Azure (Short Version)
+Run the backend locally while using a real Web PubSub instance (and optionally Table storage) in Azure:
+1. `azd up` (once) provisions resources.
+2. Create a local `.env` with:
+   ```
+   TRANSPORT_MODE=webpubsub
+   WEBPUBSUB_ENDPOINT=https://<name>.webpubsub.azure.com
+   # optional persistence
+   STORAGE_MODE=table
+   ```
+3. `python start_dev.py`
+4. (Optional) Tunnel for CloudEvents (see ADVANCED.md §2.3)
+
+More: **[ADVANCED.md](./docs/ADVANCED.md#2-local-development-paths)**
+
+## FAQ (Quick)
+**Do I need Azure to try it?** No—local mode works offline.
+
+**Why Web PubSub?** Managed scale, groups, CloudEvents, secure client negotiation.
+
+**Where are advanced knobs?** All in `docs/ADVANCED.md` (RBAC, credential chain, persistence, CloudEvents, tunnels).
+
+## Next Steps
+- Explore advanced capabilities: [docs/ADVANCED.md](./docs/ADVANCED.md)
+- Try hybrid tunnel mode for full lifecycle locally
+- Customize AI logic in `python_server/chat_model_client.py`
+- Review how scalable history works now (Table storage) in the persistence section of the advanced doc.
+
+## Debugging & Logs
+**Control runtime log level**
+- Set `LOG_LEVEL` to adjust all server logs (`DEBUG`, `INFO`, `WARNING`, `ERROR`). Defaults to `INFO`.
+- Optional: customize the format with `LOG_FORMAT` (defaults to `"%(asctime)s %(levelname)s %(name)s: %(message)s"`).
+
+Example (PowerShell):
+```pwsh
+$env:LOG_LEVEL="DEBUG"
+python start_dev.py
+```
+- `DEBUG` enables verbose traces from Flask, OpenAI SDK, and httpx transport.
+
+**Azure App Service**
+- Portal → App Service → Configuration → Application settings → add `LOG_LEVEL`, then restart.
+- Stream logs: `az webapp log tail --resource-group <rg> --name <app-name>`.
+
+## Troubleshooting
+**App Service setting `GITHUB_TOKEN` missing after `azd up`**
+1. Make sure you set the value *before* the first `azd provision`: `azd env set githubModelsToken <token>`.
+3. If you added the token *after* the first deployment, run `azd provision` (you don't need `azd deploy` for an app setting change). Use `azd provision --no-state` if it claims no changes.
+
+**Changed token but app setting didn’t update**
+- Confirm the parameter file or environment value is non-empty.
+- Run `azd env get githubModelsToken` to verify what azd stored.
+- Re-run `azd provision`. (Only a code change needs `azd deploy`.)
+
+**Early `ECONNREFUSED` errors in the browser during local dev**
+- The React dev server starts first and immediately proxies `/api/*` to Flask while it’s still binding.
+- These transient errors vanish once `Flask app running` appears in the terminal. Safe to ignore.
+
+**Web PubSub negotiate failing (401/403 or missing access)**
+- Ensure the web app’s Managed Identity has necessary roles (e.g. Web PubSub Service Owner / Contributor) on the Web PubSub resource.
+- If using the `createRoleAssignments` parameter and you turned it off after first provision, assign roles manually.
+
+**`Unauthorized` error when calling openai**
+- Check if the GitHub PAT has **model read** permission
+
+**General diagnostic tips**
+- Show current environment values: `azd env get`.
+- List effective app settings (Azure): `az webapp config appsettings list --name <app-name> --resource-group <rg>`.
+
+---
+Happy hacking! Open an issue or PR in [our GitHub repo](https://github.com/Azure/azure-webpubsub) with feedback.
+

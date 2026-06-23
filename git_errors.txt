@@ -1,0 +1,7 @@
+error: pathspec 'Add' did not match any file(s) known to git
+error: pathspec 'upgrade' did not match any file(s) known to git
+error: pathspec 'migration' did not match any file(s) known to git
+error: pathspec 'progress' did not match any file(s) known to git
+error: pathspec 'and' did not match any file(s) known to git
+error: pathspec 'summary' did not match any file(s) known to git
+error: pathspec 'files\  ; echo COMMIT_FAILED  ; git ls-files client/.github/modernize/code-migration/20260623081445/progress.md client/.github/modernize/code-migration/20260623081445/summary.md  ; type git_errors.txt' did not match any file(s) known to git

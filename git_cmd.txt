@@ -1,0 +1,7 @@
+error: pathspec 'Add' did not match any file(s) known to git
+error: pathspec 'upgrade' did not match any file(s) known to git
+error: pathspec 'migration' did not match any file(s) known to git
+error: pathspec 'progress' did not match any file(s) known to git
+error: pathspec 'and' did not match any file(s) known to git
+error: pathspec 'summary' did not match any file(s) known to git
+error: pathspec 'files\  ; git status --short  ; git log -1 --oneline ' did not match any file(s) known to git
