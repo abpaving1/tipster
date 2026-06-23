@@ -1,508 +1,278 @@
 """
-Forebet scraper (Task 3).
+Forebet (forebet.com) scraper.
 
-Forebet publishes algorithmically-derived probability distributions and
-predicted scores for football matches. Unlike OLBG (community tipsters),
-there is no per-tipster identity here — the "tipster" is Forebet's model
-itself, represented as a single synthetic tipster row in the DB.
+Forebet provides mathematically-modelled football predictions. Each match row
+contains:
+  - Fixture (home/away teams) via schema.org microdata — clean, reliable
+  - Kickoff datetime as DD/MM/YYYY HH:MM in a .date_bah span
+  - Predicted outcome (1 / X / 2) from .forepr
+  - Win/draw/away probabilities from .fprc spans (.fpr class = highlighted)
+  - Predicted score from .ex_sc.tabonly
+  - Average predicted goals from .avg_sc.tabonly
+  - Fractional odds from .haodd spans → converted to decimal
+  - League short code from .shortTag (no full league name in listing view)
+  - Forebet match ID from the #nofav div id attribute
 
-Anti-bot profile:
-  - Forebet is rated Low–Medium difficulty in the project brief. It does NOT
-    use Cloudflare at the same level as OLBG. However, it does serve content
-    through JavaScript rendering, so Playwright is still required.
-  - playwright-stealth is applied for fingerprint consistency.
-  - Residential proxy sticky sessions are used (same session prefix as OLBG
-    scrapers to share the proxy pool).
-  - Human-timing jitter is applied between page navigations.
+Unlike OLBG, Forebet has no individual tipster identity — every pick comes
+from the same algorithmic model. We use "Forebet Model" as tipster_name and
+the forebet match ID as tipster_external_id (stable across re-scrapes, unlike
+OLBG's tip_hash-per-tip pattern).
 
-Scraping strategy:
-  - Target: /en/football-predictions (default landing page, today's matches).
-  - The page renders a table of predictions per league section.
-  - We iterate league sections → rows within each section.
-  - Each row yields: home team, away team, kickoff time, 1X2 probs, predicted
-    score, and avg goals figures.
-  - From each row we emit up to three RawPick instances:
-      1. Match result (Home Win / Draw / Away Win — whichever has highest prob)
-      2. Over/Under 2.5 (if avg goals >= 2.5, emit Over; if <= 1.8, emit Under)
-      3. BTTS (if both avg_goals_home >= 1.1 and avg_goals_away >= 1.1 → Yes)
-  - Only picks where the highest probability exceeds MIN_CONFIDENCE_PCT are
-    emitted. This filters out coin-flip predictions.
+Market mapping: Forebet only predicts 1X2 (match result) on the listing page,
+so all picks use MarketType.MATCH_RESULT. The confidence score maps to the
+highlighted win-probability percentage (the span with class="fpr").
 
-CSS selectors:
-  ⚠️  PLACEHOLDER — run with SCRAPE_HEADLESS=false and inspect live DOM before
-  going to production. Forebet has restructured its markup periodically.
-  Selector names follow a descriptive pattern so it's clear what each targets;
-  replace the string values after DOM inspection without changing the variable
-  names (consumer code references the constants).
+Run via: python cli.py forebet
 """
 
-from __future__ import annotations
-
-import asyncio
 import re
 from datetime import datetime, timezone
-from decimal import Decimal, ROUND_HALF_UP
-from typing import AsyncIterator
+from decimal import Decimal, InvalidOperation
 
-from playwright.async_api import Browser, BrowserContext, Page, Playwright, async_playwright
-from playwright_stealth import stealth_async
+from playwright.async_api import Page
 
 from config import settings
-from models.forebet import ForebetMatchResult, ForebetPrediction
 from models.pick import MarketType, RawPick
-from utils.jitter import human_jitter
+from sources.base_scraper import BaseSourceScraper
+from utils.jitter import human_scroll, jitter_delay
 from utils.logger import get_logger
-from utils.proxy import build_proxy_config
 
 logger = get_logger(__name__)
 
-# ─── Confidence filter ────────────────────────────────────────────────────────
-# Only emit a pick if the winning outcome's probability exceeds this threshold.
-# 55 % means we reject anything close to a coin-flip. Tune in .env via
-# FOREBET_MIN_CONFIDENCE_PCT if needed (add to Settings).
-MIN_CONFIDENCE_PCT: float = 55.0
+# Verified against forebet.com/en/football-tips-and-predictions-for-today (Jun 2026)
+FOREBET_LISTING_PATH = "/en/football-tips-and-predictions-for-today"
 
-# Over/Under thresholds — derived from avg-goals figures on the row.
-OVER_25_THRESHOLD: float = 2.5   # avg_goals_home + away >= this → Over 2.5
-UNDER_25_THRESHOLD: float = 1.8  # sum <= this → Under 2.5
-BTTS_THRESHOLD: float = 1.1      # each side must individually >= this → BTTS Yes
+# Selectors — verified against live DOM snapshot
+SEL_MATCH_ROW = "div.rcnt"
+SEL_HOME_TEAM = "span.homeTeam span[itemprop='name']"
+SEL_AWAY_TEAM = "span.awayTeam span[itemprop='name']"
+SEL_KICKOFF = "span.date_bah"
+SEL_MATCH_LINK = "a.tnmscn"
+SEL_LEAGUE_CODE = "span.shortTag"
+SEL_PREDICTION = "span.forepr span"      # 1, X, or 2
+SEL_PREDICTED_SCORE = "div.ex_sc.tabonly"
+SEL_AVG_GOALS = "div.avg_sc.tabonly"
+SEL_PROBS = "div.fprc span"              # three spans: home%, draw%, away%
+SEL_ODDS = "div.haodd span"             # 6 spans: H/D/A odds then metadata
+SEL_MATCH_ID = "div.nofav"              # id attribute = forebet match id
 
-# Synthetic tipster identity — Forebet is an algorithm, not a person.
-FOREBET_TIPSTER_NAME: str = "Forebet Algorithm"
-FOREBET_TIPSTER_EXTERNAL_ID: str = "forebet-algorithm-v1"
+FOREBET_TIPSTER_NAME = "Forebet Model"
 
-# ─── CSS selectors ────────────────────────────────────────────────────────────
-# ⚠️  VERIFY THESE AGAINST LIVE DOM before production use.
-# Forebet uses a table layout. Each league section has a header row followed
-# by match rows. The structure as of mid-2025 is documented below; update
-# after DOM inspection with SCRAPE_HEADLESS=false.
+# Predicted outcome code → selection label stored in picks.selection
+_OUTCOME_MAP: dict[str, str] = {
+    "1": "Home",
+    "X": "Draw",
+    "2": "Away",
+}
 
-# Outer container holding all prediction rows (the full predictions table).
-# In the live DOM this is typically a <div> wrapping a <table> or a styled
-# grid. Inspect: look for the element that repeats once per match.
-SEL_PREDICTION_ROW = "table.schema tr.rcnt"
-FALLBACK_ROW_SELECTORS = ["table tr.rcnt","tr[data-match]"]
+# Index into the haodd odds spans for each predicted outcome
+_ODDS_IDX: dict[str, int] = {"1": 0, "X": 1, "2": 2}
 
-# Within each row:
-SEL_HOME_TEAM     = "td.homeTeam span"          # home team name text node
-SEL_AWAY_TEAM     = "td.awayTeam span"          # away team name text node
-SEL_KICKOFF_TIME  = "td.date_bah"               # raw "DD/MM HH:MM" or ISO text
-SEL_LEAGUE_NAME   = "td.shortTag span"          # league label (e.g. "Premier League")
 
-# 1X2 probability cells — three consecutive <td> elements with the %  values.
-SEL_PROB_HOME     = "td.predict span.forepr"    # e.g. "62%"
-SEL_PROB_DRAW     = "td.predict:nth-child(2) span.forepr"
-SEL_PROB_AWAY     = "td.predict:nth-child(3) span.forepr"
-
-# Predicted score — typically "2:1" or "1:0" in a single cell.
-SEL_PREDICTED_SCORE = "td.lscr_td span.lscrsp"
-
-# Average goals per side — two cells, home then away.
-SEL_AVG_GOALS_HOME = "td.avg_sc:nth-child(1)"
-SEL_AVG_GOALS_AWAY = "td.avg_sc:nth-child(2)"
-
-# ─── Helpers ──────────────────────────────────────────────────────────────────
-
-def _parse_probability(raw: str) -> float:
-    """'62%' → 62.0. Returns 0.0 on parse failure (logged by caller)."""
-    cleaned = raw.strip().rstrip("%")
+def _fractional_to_decimal(frac: str) -> Decimal | None:
+    """
+    Convert Forebet fractional odds ("5/2", "3/4") to decimal.
+    Forebet uses "no" and "down" as placeholders for unavailable odds —
+    both return None rather than raising or defaulting to a magic number.
+    """
+    frac = frac.strip().lower()
+    if frac in ("no", "down", "", "-"):
+        return None
     try:
-        return float(cleaned)
-    except ValueError:
-        return 0.0
+        if "/" in frac:
+            num, denom = frac.split("/", 1)
+            return (Decimal(num) / Decimal(denom) + Decimal("1")).quantize(Decimal("0.001"))
+        return Decimal(frac).quantize(Decimal("0.001"))
+    except (InvalidOperation, ZeroDivisionError, ValueError):
+        return None
 
 
-def _implied_odds(prob_pct: float) -> Decimal:
-    """Convert a probability percentage to decimal odds, capped at 100.0
-    (i.e. minimum 1 % probability) to avoid division by zero."""
-    if prob_pct <= 0:
-        prob_pct = 1.0
-    raw = Decimal(str(100.0 / prob_pct))
-    return raw.quantize(Decimal("0.001"), rounding=ROUND_HALF_UP)
-
-
-def _parse_predicted_score(raw: str) -> tuple[int | None, int | None]:
-    """'2:1' → (2, 1). Returns (None, None) on any parse failure."""
-    match = re.match(r"(\d+)\s*[:\-]\s*(\d+)", raw.strip())
-    if match:
-        return int(match.group(1)), int(match.group(2))
-    return None, None
-
-
-def _parse_avg_goals(raw: str) -> float | None:
-    """'1.45' → 1.45. Returns None on failure."""
+def _parse_forebet_kickoff(text: str) -> datetime | None:
+    """
+    Parse Forebet's DD/MM/YYYY HH:MM kickoff string into UTC.
+    Forebet displays kickoff times in venue-local time — we store them as-is
+    (treated as UTC) since venue timezone is not available in the listing view.
+    This is a known approximation; flagged here for future TZ-aware handling.
+    """
     try:
-        return float(raw.strip())
+        return datetime.strptime(text.strip(), "%d/%m/%Y %H:%M").replace(tzinfo=timezone.utc)
     except ValueError:
         return None
 
 
-def _parse_kickoff(raw: str) -> datetime | None:
-    """
-    Attempt to parse Forebet's kickoff display into a UTC-aware datetime.
-    Forebet typically shows times in CET/CEST without an explicit TZ label.
-    We store as UTC; offset is applied as a best-effort (CET = UTC+1).
-
-    Formats tried, in order:
-      "15/06 20:45"   (current year assumed)
-      "2025-06-15 20:45"
-      "20:45"          (today assumed — risky, only used as last resort)
-    """
-    raw = raw.strip()
-    now = datetime.now(timezone.utc)
-
-    patterns = [
-        ("%d/%m %H:%M", True),       # DD/MM HH:MM — inject current year
-        ("%Y-%m-%d %H:%M", False),   # ISO-ish — full date present
-        ("%H:%M", True),             # time only — inject today
-    ]
-
-    for fmt, inject_year in patterns:
-        try:
-            if inject_year and "%Y" not in fmt and "%d/%m" in fmt:
-                raw_with_year = f"{now.year}/{raw}"
-                parsed = datetime.strptime(raw_with_year, f"%Y/{fmt}")
-            elif inject_year and "%H:%M" == fmt:
-                date_str = now.strftime("%Y-%m-%d") + " " + raw
-                parsed = datetime.strptime(date_str, "%Y-%m-%d %H:%M")
-            else:
-                parsed = datetime.strptime(raw, fmt)
-
-            # Assume CET (UTC+1) — good enough for pre-match scheduling;
-            # a full TZ library (pytz / zoneinfo) would be overkill here
-            # given we only need the date to be right for dedup purposes.
-            utc_offset_hours = 1
-            utc_ts = parsed.replace(tzinfo=timezone.utc) - \
-                     __import__("datetime").timedelta(hours=utc_offset_hours)
-            return utc_ts
-        except ValueError:
-            continue
-
-    logger.warning("forebet_kickoff_parse_failed", raw=raw)
-    return None
-
-
-# ─── Main scraper class ───────────────────────────────────────────────────────
-
-class ForebetScraper:
-    """
-    Playwright-based scraper for forebet.com/en/football-predictions.
-
-    Lifecycle:
-        async with ForebetScraper() as scraper:
-            async for pick in scraper.scrape():
-                await publisher.publish(pick)
-
-    The class manages its own Playwright/browser context so teardown is
-    guaranteed even if scraping raises partway through.
-    """
-
-    SOURCE_SLUG = "forebet"
+class ForebetScraper(BaseSourceScraper):
+    source_slug = "forebet"
 
     def __init__(self) -> None:
-        self._playwright: Playwright | None = None
-        self._browser: Browser | None = None
-        self._context: BrowserContext | None = None
+        super().__init__()
+        self.base_url = "https://www.forebet.com"
+        self.listing_url = f"{self.base_url}{FOREBET_LISTING_PATH}"
 
-    # ── Context manager ──────────────────────────────────────────────────────
-
-    async def __aenter__(self) -> "ForebetScraper":
-        self._playwright = await async_playwright().start()
-        proxy_cfg = build_proxy_config(session_id="forebet-main")
-
-        self._browser = await self._playwright.chromium.launch(
-            headless=settings.scrape_headless,
-            args=[
-                "--no-sandbox",
-                "--disable-blink-features=AutomationControlled",
-            ],
-        )
-        self._context = await self._browser.new_context(
-            proxy=proxy_cfg,
-            locale="en-GB",
-            timezone_id="Europe/London",
-            viewport={"width": 1366, "height": 768},
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/125.0.0.0 Safari/537.36"
-            ),
-        )
-        return self
-
-    async def __aexit__(self, *_: object) -> None:
-        if self._context:
-            await self._context.close()
-        if self._browser:
-            await self._browser.close()
-        if self._playwright:
-            await self._playwright.stop()
-
-    # ── Public API ───────────────────────────────────────────────────────────
-
-    async def scrape(self) -> AsyncIterator[RawPick]:
-        """
-        Yields validated RawPick instances — one per market per match.
-        Caller is responsible for publishing to Redis.
-        """
-        page = await self._context.new_page()
-        await stealth_async(page)
+    async def scrape(self) -> list[RawPick]:
+        page = await self.new_stealth_page()
+        picks: list[RawPick] = []
 
         try:
-            await self._navigate(page)
-            async for pick in self._extract_picks(page):
-                yield pick
+            await self.goto_with_retry(page, self.listing_url)
+            await self._dismiss_cookie_banner(page)
+            await human_scroll(page, distance_px=2000, steps=12)
+            await jitter_delay(1.0, 2.0)
+
+            rows = await page.query_selector_all(SEL_MATCH_ROW)
+            logger.info("forebet_rows_found", count=len(rows), source=self.source_slug)
+
+            for row in rows:
+                try:
+                    pick = await self._parse_row(row)
+                    if pick is not None:
+                        picks.append(pick)
+                        await self.publish_pick(pick)
+                except Exception:
+                    logger.exception("forebet_row_parse_failed", source=self.source_slug)
+
+            if not picks:
+                logger.error(
+                    "forebet_scrape_yielded_zero_picks",
+                    source=self.source_slug,
+                    msg="No picks extracted — check for selector drift or anti-bot block",
+                )
+
         finally:
             await page.close()
 
-    # ── Navigation ───────────────────────────────────────────────────────────
+        logger.info("scrape_complete", source=self.source_slug, picks_found=len(picks))
+        return picks
 
-    async def _navigate(self, page: Page) -> None:
-        url = settings.forebet_football_url
-        logger.info("forebet_navigating", url=url)
-
-        await page.goto(url, wait_until="domcontentloaded", timeout=settings.scrape_timeout_ms)
-
-        # Wait for at least one prediction row — if this times out, the
-        # selector is stale and needs updating (run with SCRAPE_HEADLESS=false).
-        try:
-            await page.wait_for_selector(SEL_PREDICTION_ROW, timeout=15_000)
-        except Exception:
-            logger.error(
-                "forebet_prediction_rows_not_found",
-                selector=SEL_PREDICTION_ROW,
-                hint="Run with SCRAPE_HEADLESS=false to inspect live DOM and update selectors.",
-            )
-            raise
-
-        await human_jitter()
-        logger.info("forebet_page_loaded", url=url)
-
-    # ── Row extraction ────────────────────────────────────────────────────────
-
-    async def _extract_picks(self, page: Page) -> AsyncIterator[RawPick]:
-        rows = await page.query_selector_all(SEL_PREDICTION_ROW)
-        logger.info("forebet_rows_found", count=len(rows))
-
-        for row in rows:
-            await human_jitter()
-
+    async def _dismiss_cookie_banner(self, page: Page) -> None:
+        """Forebet uses Cookiebot — try known selectors, non-fatal if absent."""
+        for selector in (
+            "#CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll",
+            "button[id*='accept']",
+            "button[class*='accept']",
+        ):
             try:
-                prediction = await self._parse_row(page, row)
-            except Exception as exc:
-                logger.warning("forebet_row_parse_error", error=str(exc))
+                btn = await page.query_selector(selector)
+                if btn and await btn.is_visible():
+                    await jitter_delay(0.5, 1.2)
+                    await btn.click()
+                    await page.wait_for_timeout(800)
+                    return
+            except Exception:  # noqa: BLE001
                 continue
 
-            if prediction is None:
-                continue
-
-            if not self._validate_prediction(prediction):
-                continue
-
-            for result in self._derive_picks(prediction):
-                yield self._to_raw_pick(prediction, result)
-
-    async def _parse_row(self, page: Page, row) -> ForebetPrediction | None:
-        """
-        Extracts all fields from a single prediction table row.
-        Returns None if essential fields (teams, probabilities) are missing.
-        """
-
-        async def text(selector: str) -> str:
-            el = await row.query_selector(selector)
-            return (await el.inner_text()).strip() if el else ""
-
-        home_team  = await text(SEL_HOME_TEAM)
-        away_team  = await text(SEL_AWAY_TEAM)
-
+    async def _parse_row(self, row) -> RawPick | None:
+        # --- Teams (schema.org microdata — most reliable field on the page) ---
+        home_el = await row.query_selector(SEL_HOME_TEAM)
+        away_el = await row.query_selector(SEL_AWAY_TEAM)
+        if home_el is None or away_el is None:
+            return None
+        home_team = (await home_el.inner_text()).strip()
+        away_team = (await away_el.inner_text()).strip()
         if not home_team or not away_team:
-            # Likely a league-header row, not a match row — skip silently.
             return None
 
-        raw_kickoff    = await text(SEL_KICKOFF_TIME)
-        raw_league     = await text(SEL_LEAGUE_NAME)
-        raw_prob_home  = await text(SEL_PROB_HOME)
-        raw_prob_draw  = await text(SEL_PROB_DRAW)
-        raw_prob_away  = await text(SEL_PROB_AWAY)
-        raw_score      = await text(SEL_PREDICTED_SCORE)
-        raw_avg_home   = await text(SEL_AVG_GOALS_HOME)
-        raw_avg_away   = await text(SEL_AVG_GOALS_AWAY)
+        # --- Match ID (stable forebet identifier → tipster_external_id) ---
+        # Using the match ID (not a hash) means re-scraping the same fixture
+        # will always produce the same tipster_external_id, unlike OLBG's
+        # tip_hash-per-tip pattern. This IS the dedup key downstream.
+        match_id_el = await row.query_selector(SEL_MATCH_ID)
+        match_id: str | None = None
+        if match_id_el is not None:
+            match_id = await match_id_el.get_attribute("id")
+        if not match_id:
+            link_el = await row.query_selector(SEL_MATCH_LINK)
+            if link_el is not None:
+                href = await link_el.get_attribute("href") or ""
+                match_id = href.rstrip("/").split("/")[-1]
+        if not match_id:
+            logger.warning(
+                "forebet_missing_match_id",
+                home=home_team,
+                away=away_team,
+                source=self.source_slug,
+            )
+            return None
 
-        home_prob = _parse_probability(raw_prob_home)
-        draw_prob = _parse_probability(raw_prob_draw)
-        away_prob = _parse_probability(raw_prob_away)
+        # --- Kickoff ---
+        kickoff_el = await row.query_selector(SEL_KICKOFF)
+        kickoff_utc = None
+        if kickoff_el is not None:
+            kickoff_utc = _parse_forebet_kickoff(await kickoff_el.inner_text())
 
-        score_home, score_away = _parse_predicted_score(raw_score)
+        # --- League short code ---
+        league_el = await row.query_selector(SEL_LEAGUE_CODE)
+        league_name = (await league_el.inner_text()).strip() if league_el else None
 
-        raw_text = (
-            f"{home_team} v {away_team} | {raw_league} | {raw_kickoff} | "
-            f"{raw_prob_home}/{raw_prob_draw}/{raw_prob_away} | score: {raw_score}"
+        # --- Predicted outcome (1 / X / 2) ---
+        pred_el = await row.query_selector(SEL_PREDICTION)
+        if pred_el is None:
+            logger.warning(
+                "forebet_missing_prediction",
+                home=home_team,
+                away=away_team,
+                source=self.source_slug,
+            )
+            return None
+        outcome_code = (await pred_el.inner_text()).strip()
+        selection = _OUTCOME_MAP.get(outcome_code)
+        if selection is None:
+            logger.warning(
+                "forebet_unmapped_outcome",
+                outcome=outcome_code,
+                home=home_team,
+                away=away_team,
+                source=self.source_slug,
+            )
+            return None
+
+        # --- Confidence: the highlighted probability span (.fpr class) ---
+        confidence: Decimal | None = None
+        for el in await row.query_selector_all(SEL_PROBS):
+            if "fpr" in (await el.get_attribute("class") or ""):
+                try:
+                    confidence = Decimal((await el.inner_text()).strip())
+                except InvalidOperation:
+                    pass
+                break
+
+        # --- Decimal odds for the predicted outcome ---
+        # haodd spans: [home_frac, draw_frac, away_frac, meta, meta, meta]
+        odds_decimal: Decimal | None = None
+        odds_els = await row.query_selector_all(SEL_ODDS)
+        if len(odds_els) >= 3:
+            outcome_odds_idx = _ODDS_IDX.get(outcome_code, 0)
+            frac_text = (await odds_els[outcome_odds_idx].inner_text()).strip()
+            odds_decimal = _fractional_to_decimal(frac_text)
+
+        # --- Raw text for human-readable context ---
+        score_el = await row.query_selector(SEL_PREDICTED_SCORE)
+        avg_el = await row.query_selector(SEL_AVG_GOALS)
+        pred_score = (await score_el.inner_text()).strip() if score_el else ""
+        avg_goals = (await avg_el.inner_text()).strip() if avg_el else ""
+
+        raw_text = " | ".join(
+            part for part in [
+                f"{home_team} vs {away_team}",
+                f"Prediction: {outcome_code} ({selection})",
+                f"Score: {pred_score}" if pred_score else "",
+                f"Avg goals: {avg_goals}" if avg_goals else "",
+                f"Confidence: {confidence}%" if confidence else "",
+            ]
+            if part
         )
 
-        return ForebetPrediction(
-            source_slug=self.SOURCE_SLUG,
-            home_team=home_team,
-            away_team=away_team,
-            league_name=raw_league or "Unknown",
-            kickoff_utc=_parse_kickoff(raw_kickoff),
-            home_prob=home_prob,
-            draw_prob=draw_prob,
-            away_prob=away_prob,
-            predicted_score_home=score_home,
-            predicted_score_away=score_away,
-            implied_odds_home=_implied_odds(home_prob),
-            implied_odds_draw=_implied_odds(draw_prob),
-            implied_odds_away=_implied_odds(away_prob),
-            avg_goals_home=_parse_avg_goals(raw_avg_home),
-            avg_goals_away=_parse_avg_goals(raw_avg_away),
-            raw_text=raw_text,
-        )
-
-    # ── Validation ────────────────────────────────────────────────────────────
-
-    def _validate_prediction(self, p: ForebetPrediction) -> bool:
-        """
-        Returns False (and logs a warning) if the prediction is malformed.
-        We're conservative: a probability sum wildly outside 95–105 % almost
-        certainly means the selector grabbed the wrong element.
-        """
-        total = p.home_prob + p.draw_prob + p.away_prob
-        if not (90.0 <= total <= 110.0):
-            logger.warning(
-                "forebet_probability_sum_invalid",
-                home=p.home_team,
-                away=p.away_team,
-                total=total,
-            )
-            return False
-
-        if p.home_prob <= 0 or p.draw_prob <= 0 or p.away_prob <= 0:
-            logger.warning(
-                "forebet_zero_probability",
-                home=p.home_team,
-                away=p.away_team,
-            )
-            return False
-
-        return True
-
-    # ── Pick derivation ───────────────────────────────────────────────────────
-
-    def _derive_picks(self, p: ForebetPrediction) -> list[ForebetMatchResult]:
-        """
-        Converts one ForebetPrediction into 1–3 ForebetMatchResult instances.
-
-        Rules:
-          1. Match result — always emitted if winning prob > MIN_CONFIDENCE_PCT.
-          2. Over/Under 2.5 — emitted if avg_goals sum qualifies AND the
-             implied outcome has prob > MIN_CONFIDENCE_PCT.
-          3. BTTS Yes — emitted if both sides' avg_goals >= BTTS_THRESHOLD.
-        """
-        results: list[ForebetMatchResult] = []
-
-        # 1. Match result
-        candidates = [
-            ("Home Win",  p.home_prob, p.implied_odds_home),
-            ("Draw",      p.draw_prob, p.implied_odds_draw),
-            ("Away Win",  p.away_prob, p.implied_odds_away),
-        ]
-        selection, best_prob, best_odds = max(candidates, key=lambda c: c[1])
-
-        if best_prob >= MIN_CONFIDENCE_PCT:
-            results.append(ForebetMatchResult(
-                market="match_result",
-                selection=selection,
-                odds_decimal=best_odds,
-                confidence=round(best_prob / 100.0, 4),
-                raw_text=p.raw_text,
-            ))
-        else:
-            logger.debug(
-                "forebet_match_result_below_threshold",
-                home=p.home_team,
-                away=p.away_team,
-                best_prob=best_prob,
-                threshold=MIN_CONFIDENCE_PCT,
-            )
-
-        # 2. Over/Under 2.5
-        if p.avg_goals_home is not None and p.avg_goals_away is not None:
-            avg_total = p.avg_goals_home + p.avg_goals_away
-
-            if avg_total >= OVER_25_THRESHOLD:
-                # Implied probability of Over 2.5 from the goals model.
-                # Forebet doesn't publish an explicit O/U %, so we derive a
-                # rough confidence: linearly scale avg_total vs threshold.
-                # e.g. avg 3.0 goals → ~75 % confidence; 2.5 → 55 %.
-                over_confidence = min(0.85, 0.55 + (avg_total - OVER_25_THRESHOLD) * 0.15)
-                # Implied odds: 1 / confidence
-                over_odds = Decimal(str(round(1.0 / over_confidence, 3)))
-
-                if over_confidence * 100 >= MIN_CONFIDENCE_PCT:
-                    results.append(ForebetMatchResult(
-                        market="over_under_25",
-                        selection="Over 2.5",
-                        odds_decimal=over_odds,
-                        confidence=round(over_confidence, 4),
-                        raw_text=p.raw_text,
-                    ))
-
-            elif avg_total <= UNDER_25_THRESHOLD:
-                under_confidence = min(0.80, 0.55 + (UNDER_25_THRESHOLD - avg_total) * 0.20)
-                under_odds = Decimal(str(round(1.0 / under_confidence, 3)))
-
-                if under_confidence * 100 >= MIN_CONFIDENCE_PCT:
-                    results.append(ForebetMatchResult(
-                        market="over_under_25",
-                        selection="Under 2.5",
-                        odds_decimal=under_odds,
-                        confidence=round(under_confidence, 4),
-                        raw_text=p.raw_text,
-                    ))
-
-        # 3. BTTS Yes
-        if (
-            p.avg_goals_home is not None
-            and p.avg_goals_away is not None
-            and p.avg_goals_home >= BTTS_THRESHOLD
-            and p.avg_goals_away >= BTTS_THRESHOLD
-        ):
-            # Confidence proportional to how far both sides exceed the threshold.
-            margin = min(p.avg_goals_home, p.avg_goals_away) - BTTS_THRESHOLD
-            btts_confidence = min(0.80, 0.55 + margin * 0.25)
-            btts_odds = Decimal(str(round(1.0 / btts_confidence, 3)))
-
-            if btts_confidence * 100 >= MIN_CONFIDENCE_PCT:
-                results.append(ForebetMatchResult(
-                    market="btts",
-                    selection="Yes",
-                    odds_decimal=btts_odds,
-                    confidence=round(btts_confidence, 4),
-                    raw_text=p.raw_text,
-                ))
-
-        return results
-
-    # ── RawPick conversion ────────────────────────────────────────────────────
-
-    def _to_raw_pick(
-        self,
-        prediction: ForebetPrediction,
-        result: ForebetMatchResult,
-    ) -> RawPick:
-        """Maps ForebetMatchResult + its parent ForebetPrediction to a RawPick."""
         return RawPick(
-            source_slug=self.SOURCE_SLUG,
-            tipster_external_id=FOREBET_TIPSTER_EXTERNAL_ID,
+            source_slug=self.source_slug,
+            tipster_external_id=match_id,
             tipster_name=FOREBET_TIPSTER_NAME,
-            home_team_name=prediction.home_team,
-            away_team_name=prediction.away_team,
-            league_name=prediction.league_name,
-            kickoff_utc=prediction.kickoff_utc,
-            market=MarketType(result.market),
-            selection=result.selection,
-            odds_decimal=result.odds_decimal,
-            confidence=result.confidence,
-            raw_text=result.raw_text,
-            posted_at=datetime.now(timezone.utc),
+            home_team_name=home_team,
+            away_team_name=away_team,
+            league_name=league_name,
+            kickoff_utc=kickoff_utc,
+            market=MarketType.MATCH_RESULT,
+            selection=selection,
+            odds_decimal=odds_decimal,
+            confidence=confidence,
+            raw_text=raw_text,
+            posted_at=kickoff_utc or datetime.now(timezone.utc),
         )

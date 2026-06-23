@@ -10,13 +10,14 @@ import asyncio
 import sys
 
 from sources.olbg import OLBGScraper
+from sources.forebet import ForebetScraper
 from utils.logger import configure_logging, get_logger
 
 logger = get_logger(__name__)
 
 SCRAPERS = {
     "olbg": OLBGScraper,
-    # "forebet": ForebetScraper,        # Task 3
+    "forebet": ForebetScraper,        # Task 3
     # "freesupertips": FreeSuperTipsScraper,  # Task 4
     # "soccervista": SoccerVistaScraper,      # Task 4
 }
